@@ -1,0 +1,23 @@
+﻿# --- secrets: never commit these ---
+.env
+.env.*
+!.env.example
+
+# custom pluggable data sources - auth.key_value is stored in PLAINTEXT here
+sources/
+
+# --- runtime data / caches: not secrets, but personal/scraped data, not code ---
+search_history.json
+company_cache.json
+intelligence_cache.json
+
+# --- python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# --- editor/OS noise ---
+.DS_Store
+.vscode/
+.idea/
