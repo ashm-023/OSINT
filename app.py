@@ -14,9 +14,14 @@ from urllib.parse import quote
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
+
+from job_tracker.db import Database as JobTrackerDatabase
+from job_tracker.discovery import resolve_career_page
+from job_tracker.models import CareerPage
+from job_tracker.scraper import ScrapeFilters, count_matches, scrape_jobs
 
 load_dotenv()  # reads .env in the same folder, if present
 
@@ -42,6 +47,7 @@ HISTORY_FILE = os.path.join(BASE_DIR, "search_history.json")
 COMPANY_CACHE_FILE = os.path.join(BASE_DIR, "company_cache.json")
 INTEL_CACHE_FILE = os.path.join(BASE_DIR, "intelligence_cache.json")
 SOURCES_DIR = os.path.join(BASE_DIR, "sources")  # config-driven pluggable data sources
+JOB_TRACKER_DB = os.path.join(BASE_DIR, "jobs.db")
 MAX_HISTORY = 100
 
 
@@ -271,6 +277,16 @@ class SourceDebugRequest(BaseModel):
     zero_items: bool = False  # true when the last Test call succeeded but returned 0 items
     history: list[dict] = []  # prior debug attempts for this same draft: [{error, zero_items, diagnosis, fixed_config}]
     previous_attempts: list[dict] = []  # prior Debug rounds in this session: what was tried, what happened
+
+
+class JobScrapeRequest(BaseModel):
+    company: str
+    url: Optional[str] = None
+    query: Optional[str] = None
+    location: Optional[str] = None
+    department: Optional[str] = None
+    remote: Optional[str] = None
+    until_match: bool = False
 
 
 # ----------------------------- normalizers --------------------------------
@@ -2527,6 +2543,106 @@ def remove_source(name: str):
     return {"deleted": True, "name": name}
 
 
+# ----------------------------- job tracker --------------------------------
+
+def _job_tracker_db() -> JobTrackerDatabase:
+    return JobTrackerDatabase(JOB_TRACKER_DB)
+
+
+@app.get("/api/jobs/companies")
+def jobs_list_companies():
+    db = _job_tracker_db()
+    try:
+        return {"companies": db.list_companies()}
+    finally:
+        db.close()
+
+
+@app.get("/api/jobs/filters")
+def jobs_filters(company: Optional[str] = Query(None)):
+    db = _job_tracker_db()
+    try:
+        return {"filters": db.job_filters(company)}
+    finally:
+        db.close()
+
+
+@app.get("/api/jobs")
+def jobs_query(
+    company: Optional[str] = Query(None),
+    q: Optional[str] = Query(None),
+    location: Optional[str] = Query(None),
+    department: Optional[str] = Query(None),
+    remote: Optional[str] = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    db = _job_tracker_db()
+    try:
+        jobs = db.query_jobs(
+            company=company,
+            query=q,
+            location=location,
+            department=department,
+            remote=remote,
+            limit=limit,
+        )
+        return {"jobs": jobs, "count": len(jobs)}
+    finally:
+        db.close()
+
+
+@app.post("/api/jobs/scrape")
+def jobs_scrape(req: JobScrapeRequest):
+    company = (req.company or "").strip()
+    if not company:
+        raise HTTPException(400, "Company name is required.")
+
+    db = _job_tracker_db()
+    try:
+        url = (req.url or "").strip() or None
+        cached = db.get_company(company)
+        if url:
+            page = resolve_career_page(company, prefer_url=url)
+        elif cached and cached.get("career_url"):
+            page = CareerPage(
+                company=cached["name"],
+                url=cached["career_url"],
+                ats=cached.get("ats"),
+                board_token=cached.get("board_token"),
+                confidence=1.0,
+                source="db",
+            )
+        else:
+            page = resolve_career_page(company)
+
+        db.upsert_company(page)
+        filters = ScrapeFilters(
+            query=(req.query or "").strip() or None,
+            location=(req.location or "").strip() or None,
+            department=(req.department or "").strip() or None,
+            remote=(req.remote or "").strip() or None,
+        )
+        hunt = req.until_match or bool((req.query or "").strip())
+        jobs = scrape_jobs(page, filters=filters, until_match=hunt)
+        saved = db.upsert_jobs(jobs)
+        matched = count_matches(jobs, filters)
+        return {
+            "company": company,
+            "career_url": page.url,
+            "ats": page.ats,
+            "count": len(jobs),
+            "saved": saved,
+            "matched_count": matched,
+            "found_match": matched > 0,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, str(e))
+    finally:
+        db.close()
+
+
 # ----------------------------- frontend (embedded) -------------------------
 
 INDEX_HTML = r"""<!DOCTYPE html>
@@ -2600,6 +2716,31 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .batch-card .btitle { font-size: 14px; font-weight: 700; }
   .batch-card .bdesc { font-size: 12px; color: var(--ink-dim); margin-top: 2px; }
   .batch-card .go-tag { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-faint); }
+
+  /* ---------- job tracker ---------- */
+  .jobs-layout { display: grid; grid-template-columns: minmax(0, 260px) minmax(0, 1fr); gap: 18px; align-items: start; }
+  @media (max-width: 760px) { .jobs-layout { grid-template-columns: 1fr; } }
+  .jobs-sidebar {
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 14px; min-width: 0; overflow: hidden;
+  }
+  .jobs-sidebar h3 { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-faint); margin-bottom: 10px; }
+  .jobs-filters { display: grid; gap: 10px; min-width: 0; }
+  .jobs-main { min-width: 0; }
+  .jobs-main-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px; gap: 12px; }
+  .jobs-main-head h3 { font-size: 14px; font-weight: 600; }
+  .jobs-main-head .meta { font-size: 12px; color: var(--ink-dim); white-space: nowrap; }
+  .job-row { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; margin-bottom: 8px; }
+  .job-row .jr-title { font-size: 15px; font-weight: 600; line-height: 1.35; }
+  .job-row .jr-title a { text-decoration: none; word-break: break-word; }
+  .job-row .jr-title a:hover { color: var(--signal); }
+  .job-row .jr-meta { font-size: 12px; color: var(--ink-dim); margin-top: 4px; line-height: 1.45; }
+  .job-pill { display: inline-block; font-size: 10px; padding: 2px 7px; border-radius: 5px; border: 1px solid var(--line); color: var(--signal); margin-top: 6px; }
+  #jobsView .control .row { align-items: flex-end; }
+  @media (max-width: 760px) {
+    #jobsView .control .row { flex-direction: column; align-items: stretch; }
+    #jobsView .control .go { width: 100%; }
+  }
 
   /* ---------- back bar ---------- */
   .backbar { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; flex-wrap: wrap; }
@@ -2847,6 +2988,25 @@ INDEX_HTML = r"""<!DOCTYPE html>
     border-radius: 8px; padding: 10px 14px; margin-bottom: 18px; }
   .intel-errors summary { cursor: pointer; font-weight: 600; }
 
+  /* job tracker filters — own classes, no .field/.go conflicts */
+  .jobs-filters .jf { display: block; width: 100%; min-width: 0; max-width: 100%; box-sizing: border-box; }
+  .jobs-filters .jf label { display: block; font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-faint); margin-bottom: 7px; }
+  .jobs-filters .jf input,
+  .jobs-filters .jf select {
+    display: block; width: 100%; min-width: 0; max-width: 100%; box-sizing: border-box;
+    background: var(--bg); border: 1px solid var(--line); color: var(--ink);
+    padding: 10px 12px; border-radius: 8px; font-size: 13px; font-family: inherit;
+  }
+  .jobs-filters .jf input:focus,
+  .jobs-filters .jf select:focus { outline: none; border-color: var(--signal-dim); }
+  .jobs-apply-btn {
+    display: block; width: 100%; box-sizing: border-box; margin-top: 4px;
+    border: 1px solid var(--signal-dim); background: transparent; color: var(--signal);
+    font-weight: 600; padding: 11px 16px; border-radius: 8px; cursor: pointer;
+    font-size: 14px; font-family: inherit;
+  }
+  .jobs-apply-btn:hover { filter: brightness(1.1); }
+
   .hidden { display: none !important; }
 </style>
 </head>
@@ -2994,6 +3154,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <button class="back" onclick="enterPlatform('x')">X / Twitter</button>
         <button class="back" onclick="openCompanyProfiles()">Company Profiles</button>
         <button class="back" onclick="navigateTo('batchView')">Batch Import</button>
+        <button class="back" onclick="openJobTracker()">Job Tracker</button>
         <button class="back" onclick="openSources()">Data Sources</button>
       </div>
       <div class="control">
@@ -3044,13 +3205,59 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div id="srcList"></div>
     </section>
 
+    <section id="jobsView" class="hidden">
+      <div class="backbar">
+        <button class="back" onclick="goBack()">← Back</button>
+        <div class="viewing-tag"><span class="chip intel">JT</span>Job Tracker</div>
+      </div>
+      <div class="control">
+        <div class="row">
+          <div class="field"><label for="jobsCompany">Company</label>
+            <input type="text" id="jobsCompany" placeholder="e.g. NVIDIA, Stripe, Notion"></div>
+          <div class="field"><label for="jobsUrl">Careers URL (optional)</label>
+            <input type="text" id="jobsUrl" placeholder="https://boards.greenhouse.io/…"></div>
+          <button class="go intel-btn" id="jobsScrapeBtn" onclick="scrapeJobs()">Find &amp; scrape</button>
+        </div>
+        <p class="hint">Searches for the company's careers page (Greenhouse, Lever, Ashby, Workday, etc.), pulls all open roles, and caches them locally. Re-scraping updates the list.</p>
+        <div class="automate-status hidden" id="jobsStatus"><span class="spinner intel-spin"></span><span id="jobsStatusText">Working…</span></div>
+      </div>
+      <div class="jobs-layout">
+        <aside class="jobs-sidebar">
+          <div class="jobs-filters">
+            <h3>Filters</h3>
+            <div class="jf"><label for="jobsKeyword">Keyword</label>
+              <input type="text" id="jobsKeyword" placeholder="engineer, sales…"></div>
+            <div class="jf"><label for="jobsLocation">Location</label>
+              <input type="text" id="jobsLocation" placeholder="New York, Remote…"></div>
+            <div class="jf"><label for="jobsDepartment">Department</label>
+              <input type="text" id="jobsDepartment" placeholder="Engineering…"></div>
+            <div class="jf"><label for="jobsRemote">Remote</label>
+              <select id="jobsRemote">
+                <option value="">Any</option>
+                <option value="remote">remote</option>
+                <option value="hybrid">hybrid</option>
+                <option value="onsite">onsite</option>
+              </select></div>
+            <button class="jobs-apply-btn" type="button" onclick="applyJobFilters()">Apply filters</button>
+          </div>
+        </aside>
+        <div class="jobs-main">
+          <div class="jobs-main-head">
+            <h3>Open roles</h3>
+            <div class="meta" id="jobsCount">0 shown</div>
+          </div>
+          <div id="jobsResults"></div>
+        </div>
+      </div>
+    </section>
+
   </main>
 
 <script>
   const state = { provider: "apify_plus", platform: null };
   let liCompanySlug = null;
   const $ = s => document.querySelector(s);
-  const VIEWS = ["linkedinView","xView","companyProfilesView","companyDetailView","postViewerView","batchView","intelView","sourcesView"];
+  const VIEWS = ["linkedinView","xView","companyProfilesView","companyDetailView","postViewerView","batchView","intelView","sourcesView","jobsView"];
 
   fetch("/api/health").then(r=>r.json()).then(h=>{
     const a = h.apify_key_present?'<b>Apify ●</b>':'<span class="off">Apify ○</span>';
@@ -3087,6 +3294,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
   $("#runX").addEventListener("click", ()=>xTweets());
   $("#xHandle").addEventListener("keydown", e=>{ if(e.key==="Enter") xTweets(); });
   $("#intelCompany") && $("#intelCompany").addEventListener("keydown", e=>{ if(e.key==="Enter") runIntelligence(); });
+  $("#jobsCompany") && $("#jobsCompany").addEventListener("keydown", e=>{ if(e.key==="Enter") scrapeJobs(); });
+  ["jobsKeyword","jobsLocation","jobsDepartment"].forEach(id=>{
+    const el = $("#"+id);
+    if(el) el.addEventListener("keydown", e=>{ if(e.key==="Enter") applyJobFilters(); });
+  });
   $("#cdSearch").addEventListener("input", ()=>{
     if(!cdCompany) return;
     const q = $("#cdSearch").value.trim().toLowerCase();
@@ -4194,6 +4406,122 @@ INDEX_HTML = r"""<!DOCTYPE html>
   async function deleteSource(name){
     if(!confirm(`Delete source “${name}”? This removes its config file.`)) return;
     try{ await fetch(`/api/sources/${encodeURIComponent(name)}`, {method:"DELETE"}); loadSourcesList(); }catch{}
+  }
+
+  // ---------- Job Tracker ----------
+  let jobsState = { company: "" };
+
+  async function openJobTracker(){
+    navigateTo("jobsView");
+    await refreshJobsList();
+  }
+
+  async function refreshJobsList(){
+    const box = $("#jobsResults");
+    if(!box) return;
+    box.innerHTML = '<div class="loading">Loading jobs…</div>';
+    const params = new URLSearchParams();
+    if(jobsState.company) params.set("company", jobsState.company);
+    const kw = ($("#jobsKeyword")||{}).value?.trim(); if(kw) params.set("q", kw);
+    const loc = ($("#jobsLocation")||{}).value?.trim(); if(loc) params.set("location", loc);
+    const dept = ($("#jobsDepartment")||{}).value?.trim(); if(dept) params.set("department", dept);
+    const rem = ($("#jobsRemote")||{}).value; if(rem) params.set("remote", rem);
+    try{
+      const data = await (await fetch("/api/jobs?"+params)).json();
+      const jobs = data.jobs || [];
+      $("#jobsCount").textContent = jobs.length + " shown";
+      if(!jobs.length){
+        box.innerHTML = '<div class="empty">No jobs matched. Scrape a company above to get started.</div>';
+        return;
+      }
+      box.innerHTML = jobs.map(j=>`<div class="job-row">
+        <div class="jr-title"><a href="${esc(j.url)}" target="_blank" rel="noopener">${esc(j.title)}</a></div>
+        <div class="jr-meta">${esc(j.company)}${j.employment_type?" · "+esc(j.employment_type):""}${j.location?" · "+esc(j.location):""}${j.department||j.team?" · "+esc(j.department||j.team):""}</div>
+        ${j.remote?`<span class="job-pill">${esc(j.remote)}</span>`:""}
+      </div>`).join("");
+    }catch(err){
+      box.innerHTML = '<div class="error">Could not load jobs: '+esc(err.message)+'</div>';
+    }
+  }
+
+  async function applyJobFilters(){
+    const kw = ($("#jobsKeyword")||{}).value?.trim();
+    const company = jobsState.company || ($("#jobsCompany")||{}).value?.trim();
+    const loc = ($("#jobsLocation")||{}).value?.trim();
+    const dept = ($("#jobsDepartment")||{}).value?.trim();
+    const rem = ($("#jobsRemote")||{}).value;
+    const url = ($("#jobsUrl")||{}).value?.trim();
+
+    if(kw && company){
+      const status = $("#jobsStatus");
+      const statusText = $("#jobsStatusText");
+      const btn = document.querySelector(".jobs-apply-btn");
+      if(btn) btn.disabled = true;
+      status.classList.remove("hidden");
+      statusText.textContent = "Scraping pages until keyword matches…";
+      try{
+        const r = await fetch("/api/jobs/scrape", {method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({
+            company, url: url||null, query: kw,
+            location: loc||null, department: dept||null, remote: rem||null,
+            until_match: true,
+          })});
+        const data = await r.json();
+        if(!r.ok) throw new Error(data.detail||r.statusText);
+        jobsState.company = company;
+        statusText.textContent = data.found_match
+          ? `Found ${data.matched_count} match(es) after scanning ${data.count} jobs.`
+          : `Scanned ${data.count} jobs — no matches for "${kw}".`;
+      }catch(err){
+        statusText.textContent = err.message;
+      }finally{
+        if(btn) btn.disabled = false;
+      }
+    }
+    await refreshJobsList();
+  }
+
+  async function scrapeJobs(){
+    const company = $("#jobsCompany").value.trim();
+    const url = $("#jobsUrl").value.trim();
+    const kw = ($("#jobsKeyword")||{}).value?.trim();
+    const loc = ($("#jobsLocation")||{}).value?.trim();
+    const dept = ($("#jobsDepartment")||{}).value?.trim();
+    const rem = ($("#jobsRemote")||{}).value;
+    if(!company){
+      $("#jobsStatus").classList.remove("hidden");
+      $("#jobsStatusText").textContent = "Enter a company name.";
+      return;
+    }
+    const btn = $("#jobsScrapeBtn");
+    const status = $("#jobsStatus");
+    const statusText = $("#jobsStatusText");
+    btn.disabled = true;
+    status.classList.remove("hidden");
+    statusText.textContent = kw
+      ? "Finding careers page and scraping until keyword matches…"
+      : "Finding careers page and scraping jobs…";
+    try{
+      const r = await fetch("/api/jobs/scrape", {method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({
+          company, url: url||null, query: kw||null,
+          location: loc||null, department: dept||null, remote: rem||null,
+          until_match: !!kw,
+        })});
+      const data = await r.json();
+      if(!r.ok) throw new Error(data.detail||r.statusText);
+      jobsState.company = company;
+      statusText.textContent = kw
+        ? (data.found_match
+          ? `Found ${data.matched_count} match(es) after scanning ${data.count} jobs.`
+          : `Scanned ${data.count} jobs — no matches for "${kw}".`)
+        : `Found ${data.ats||"generic"} board — scraped ${data.count} jobs.`;
+      await refreshJobsList();
+    }catch(err){
+      statusText.textContent = err.message;
+    }finally{
+      btn.disabled = false;
+    }
   }
 
   // ---------- history ----------

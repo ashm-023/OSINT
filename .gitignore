@@ -10,6 +10,7 @@ sources/
 search_history.json
 company_cache.json
 intelligence_cache.json
+jobs.db
 
 # --- python ---
 __pycache__/
